@@ -1,6 +1,6 @@
-# 本地部署详细教程
+# 本地部署详细说明
 
-> 本教程面向零基础小白，按顺序操作即可在本地跑起 PromptLens。
+> 本文档面向零基础用户，按顺序操作即可在本机跑起 蓝手猫 · 一键视频克隆台。
 >
 > 全程免费，不需要付费任何服务。
 
@@ -228,7 +228,7 @@ node scripts/setup-r2-cors.mjs
 1. 左侧菜单 **APIs & Services** → **OAuth consent screen**
 2. User Type 选 **External** → **Create**
 3. 填写：
-   - App name: `PromptLens`
+   - App name: `蓝手猫 · 一键视频克隆台`
    - User support email: 你的邮箱
    - Developer contact information: 你的邮箱
 4. 一路 Save and Continue，其他可留空
@@ -355,7 +355,7 @@ SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USER=你的-gmail-邮箱
 SMTP_PASS=你的-gmail-应用专用密码
-SMTP_FROM=PromptLens <你的-gmail-邮箱>
+SMTP_FROM=蓝手猫 · 一键视频克隆台 <你的-gmail-邮箱>
 
 # ===== 管理员邮箱（可选，用于后台管理）=====
 ADMIN_EMAILS=你的邮箱@gmail.com
