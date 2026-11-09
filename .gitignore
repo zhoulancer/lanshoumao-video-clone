@@ -1,0 +1,10 @@
+node_modules/
+.next/
+data/
+runtime/
+*.log
+.env.local
+.env*.local
+tsconfig.tsbuildinfo
+public/edited/
+public/__capture_test.html

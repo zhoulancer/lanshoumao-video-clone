@@ -1,0 +1,152 @@
+import { NextRequest, NextResponse } from "next/server";
+import { auth } from "@/lib/auth";
+import { db, userApiKeys } from "@/lib/db";
+import { eq, and } from "drizzle-orm";
+import { encryptApiKey, decryptApiKey, isValidEncryptedKey } from "@/lib/utils/encryption";
+
+// GET /api/settings/api-key - 获取用户的 API Key
+export async function GET(request: NextRequest) {
+  try {
+    const session = await auth.api.getSession({ headers: request.headers });
+
+    if (!session?.user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const apiKeys = await db.query.userApiKeys.findMany({
+      where: and(
+        eq(userApiKeys.userId, session.user.id),
+        eq(userApiKeys.provider, "kie"),
+      ),
+    });
+
+    // 返回时隐藏 API Key（解密后显示部分）
+    const sanitizedKeys = apiKeys.map((key) => {
+      let displayKey = "••••••••";
+      try {
+        if (isValidEncryptedKey(key.apiKey)) {
+          const decrypted = decryptApiKey(key.apiKey);
+          displayKey = decrypted.substring(0, 8) + "••••••••" + decrypted.substring(decrypted.length - 4);
+        } else {
+          // 兼容旧数据（未加密的）
+          displayKey = key.apiKey.substring(0, 8) + "••••••••" + key.apiKey.substring(key.apiKey.length - 4);
+        }
+      } catch (e) {
+        console.error("Failed to decrypt API key:", e);
+      }
+
+      return {
+        id: key.id,
+        provider: key.provider,
+        isActive: key.isActive,
+        createdAt: key.createdAt,
+        apiKey: displayKey,
+      };
+    });
+
+    return NextResponse.json({ apiKeys: sanitizedKeys });
+  } catch (error) {
+    console.error("API key get error:", error);
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+  }
+}
+
+// POST /api/settings/api-key - 保存用户的 API Key
+export async function POST(request: NextRequest) {
+  try {
+    const session = await auth.api.getSession({ headers: request.headers });
+
+    if (!session?.user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const body = await request.json();
+    const { provider, apiKey } = body;
+
+    if (provider !== "kie") {
+      return NextResponse.json({ error: "Only KIE API keys can be saved" }, { status: 400 });
+    }
+    if (!apiKey) {
+      return NextResponse.json({ error: "Missing API key" }, { status: 400 });
+    }
+
+    if (apiKey.trim().length < 16) {
+      return NextResponse.json({ error: "Invalid Kie.ai API Key format" }, { status: 400 });
+    }
+
+    // 加密 API Key
+    const encryptedApiKey = encryptApiKey(apiKey);
+
+    const existing = await db.query.userApiKeys.findMany({
+      where: and(
+        eq(userApiKeys.userId, session.user.id),
+        eq(userApiKeys.provider, provider as any)
+      ),
+    });
+
+    if (existing.length > 0) {
+      // 更新同一用户同一 provider 的所有旧记录，避免读取时命中陈旧 key。
+      await db
+        .update(userApiKeys)
+        .set({
+          apiKey: encryptedApiKey,
+          isActive: true,
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(userApiKeys.userId, session.user.id),
+          eq(userApiKeys.provider, provider as any)
+        ));
+    } else {
+      // 创建新的（使用加密的 Key）
+      await db.insert(userApiKeys).values({
+        userId: session.user.id,
+        provider: provider as any,
+        apiKey: encryptedApiKey,
+        isActive: true,
+      });
+    }
+
+    return NextResponse.json({ success: true });
+  } catch (error) {
+    console.error("API key save error:", error);
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+  }
+}
+
+// DELETE /api/settings/api-key - 删除用户的 API Key
+export async function DELETE(request: NextRequest) {
+  try {
+    const session = await auth.api.getSession({ headers: request.headers });
+
+    if (!session?.user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const { searchParams } = new URL(request.url);
+    const id = searchParams.get("id");
+
+    if (!id) {
+      return NextResponse.json({ error: "Missing id" }, { status: 400 });
+    }
+
+    // 检查是否属于当前用户
+    const existing = await db.query.userApiKeys.findFirst({
+      where: and(
+        eq(userApiKeys.id, id),
+        eq(userApiKeys.userId, session.user.id)
+      ),
+    });
+
+    if (!existing) {
+      return NextResponse.json({ error: "API key not found" }, { status: 404 });
+    }
+
+    await db.delete(userApiKeys).where(eq(userApiKeys.id, id));
+
+    return NextResponse.json({ success: true });
+  } catch (error) {
+    console.error("API key delete error:", error);
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+  }
+}

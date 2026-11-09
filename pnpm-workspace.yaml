@@ -1,0 +1,13 @@
+packages:
+  - "."
+
+# pnpm 12 要求 camelCase 键名
+nodeLinker: hoisted
+
+onlyBuiltDependencies:
+  - "@ffmpeg-installer/ffmpeg"
+  - esbuild
+  - sharp
+  - "@prisma/engines"
+  - prisma
+  - unrs-resolver

@@ -1,0 +1,454 @@
+import { NextRequest, NextResponse } from "next/server";
+import { auth } from "@/lib/auth";
+import { db, audioAnalysis, operationLogs } from "@/lib/db";
+import { checkRateLimit, RateLimitConfigs } from "@/lib/utils/rate-limit";
+import { AssemblyAI } from "assemblyai";
+import { extractR2Key, getSignedUrlFromR2 } from "@/lib/cloudflare/r2";
+import { postJson } from "@/lib/http/json-client";
+import { resolveLocalMediaPath, transcribeWithLocalWhisper } from "@/lib/audio-processor/local-whisper";
+import { getLocalLlmEndpoint, readLocalAiConfig, applyCorrections } from "@/lib/config/local-ai";
+
+// 将公开 R2 URL 转为签名 URL，否则原样返回
+async function ensureAccessibleUrl(url: string): Promise<string> {
+  const r2Key = extractR2Key(url);
+  if (r2Key) {
+    try {
+      // 1 小时有效期，足够 AssemblyAI 下载
+      return await getSignedUrlFromR2(r2Key, 3600);
+    } catch (err) {
+      console.warn("Failed to generate signed URL, falling back to original:", err);
+      return url;
+    }
+  }
+  return url;
+}
+
+// 初始化 AssemblyAI 客户端
+function getAssemblyClient() {
+  const apiKey = process.env.ASSEMBLYAI_API_KEY;
+  if (!apiKey) {
+    throw new Error("ASSEMBLYAI_API_KEY is not configured");
+  }
+  return new AssemblyAI({
+    apiKey,
+    baseUrl: "https://api.assemblyai.com",
+  });
+}
+
+// LLM 分段函数
+async function segmentWithLLM(
+  transcription: string,
+  llmProvider: string,
+  apiKey: string
+): Promise<any[]> {
+  const systemPrompt = `你是一个视频内容分析专家。用户提供语音转文字的字幕内容，你需要：
+1. 将内容分成多个逻辑片段，每个片段代表一个独立的场景或话题
+2. 为每个片段生成：
+   - start: 起始时间（秒）
+   - end: 结束时间（秒）
+   - summary: 简短的中文摘要（1-2句话）
+   - tags: 3-5个相关标签（英文单词，用逗号分隔）
+
+请返回JSON格式的数组，示例：
+[
+  {"start": 0, "end": 15, "summary": "开场介绍项目背景", "tags": "intro,project,background"},
+  {"start": 15, "end": 45, "summary": "讲解核心技术方案", "tags": "tech,solution,core"}
+]
+
+只返回JSON，不要其他内容。`;
+
+  const userPrompt = `字幕内容：\n${transcription}`;
+
+  try {
+    // 单机模式：优先走本地大模型分段
+    if (llmProvider === "local" || llmProvider === "deepseek" || llmProvider === "openrouter") {
+      // 运行时读取网页「设置」里配置的本地端点
+      const localEp = getLocalLlmEndpoint();
+      const baseUrl =
+        llmProvider === "local"
+          ? localEp.url.replace(/\/chat\/completions$/, "")
+          : llmProvider === "deepseek"
+            ? "https://api.deepseek.com/v1"
+            : "https://openrouter.ai/api/v1";
+      const model =
+        llmProvider === "local"
+          ? localEp.model
+          : llmProvider === "deepseek"
+            ? "deepseek-chat"
+            : "anthropic/claude-3-haiku";
+
+      const data = await postJson<any>(
+        `${baseUrl}/chat/completions`,
+        {
+          model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          temperature: 0.3,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+          },
+          timeoutMs: 60_000,
+        }
+      );
+
+      const content = data.choices[0]?.message?.content || "[]";
+      // 提取 JSON 部分
+      const jsonMatch = content.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        // 确保 tags 是数组
+        return parsed.map((item: any) => ({
+          ...item,
+          tags: typeof item.tags === 'string' ? item.tags.split(',').map((t: string) => t.trim()) : item.tags || []
+        }));
+      }
+    }
+
+    // 默认返回空数组
+    return [];
+  } catch (error) {
+    console.error("LLM segmentation error:", error);
+    return [];
+  }
+}
+
+// 解析时间字符串为秒数
+function parseTimestamp(timestamp: string): number {
+  const parts = timestamp.split(":");
+  if (parts.length === 3) {
+    return parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseFloat(parts[2]);
+  } else if (parts.length === 2) {
+    return parseInt(parts[0]) * 60 + parseFloat(parts[1]);
+  }
+  return parseFloat(parts[0]);
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const session = await auth.api.getSession({ headers: request.headers });
+
+    if (!session?.user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    // 速率限制检查
+    const { allowed, resetIn } = checkRateLimit(
+      session.user.id,
+      RateLimitConfigs.analyze.limit,
+      RateLimitConfigs.analyze.windowMs
+    );
+
+    if (!allowed) {
+      return NextResponse.json(
+        { error: "请求过于频繁，请稍后再试", retryAfter: Math.ceil(resetIn / 1000) },
+        { status: 429 }
+      );
+    }
+
+    const body = await request.json();
+    const {
+      mediaUrl,
+      // 单机默认：本地 faster-whisper + 本地 LLM 分段
+      whisperModelSize = "local",
+      llmProvider = "local",
+      prompt,
+      funasrUrl,
+    } = body;
+
+    if (!mediaUrl) {
+      return NextResponse.json(
+        { error: "Missing mediaUrl" },
+        { status: 400 }
+      );
+    }
+
+    // 仅 AssemblyAI 模式需要云端 Key；本地/funasr 模式不需要
+    if (whisperModelSize !== "funasr" && whisperModelSize !== "local" && !process.env.ASSEMBLYAI_API_KEY) {
+      return NextResponse.json(
+        { error: "AssemblyAI API key is not configured. Please add ASSEMBLYAI_API_KEY to environment variables." },
+        { status: 500 }
+      );
+    }
+
+    // FunASR 模式需要用户提供地址
+    if (whisperModelSize === "funasr" && !funasrUrl) {
+      return NextResponse.json(
+        { error: "FunASR 服务地址不能为空" },
+        { status: 400 }
+      );
+    }
+
+    // 将 R2 URL 转换为签名 URL，确保 AssemblyAI / FunASR 能下载
+    const accessibleUrl = await ensureAccessibleUrl(mediaUrl);
+
+    console.log(`Starting ${whisperModelSize === "funasr" ? "FunASR" : "AssemblyAI"} transcription for:`, accessibleUrl);
+
+    // 记录分析开始
+    try {
+      await db.insert(operationLogs).values({
+        userId: session.user.id,
+        action: "analysis.start",
+        resourceType: "audio",
+        metadata: { mediaUrl, whisperModelSize, llmProvider, funasrUrl },
+      });
+    } catch (logError) {
+      console.warn("Failed to log analysis start:", logError);
+    }
+
+    let transcriptionSegments: any[] = [];
+    let fullText = "";
+    let audioDuration = 0;
+    let detectedLanguage = "unknown";
+
+    if (whisperModelSize === "local") {
+      // 单机模式：本地 faster-whisper 转写（不联网）
+      const localPath = resolveLocalMediaPath(mediaUrl);
+      if (!localPath) {
+        throw new Error("本地转写仅支持本地存储的媒体文件");
+      }
+      const result = await transcribeWithLocalWhisper(
+        localPath,
+        readLocalAiConfig().whisperModel,
+      );
+      transcriptionSegments = result.segments.map((s) => ({
+        start: s.start,
+        end: s.end,
+        text: s.text,
+        speaker: "unknown",
+      }));
+      fullText = result.segments.map((s) => s.text).join(" ");
+      audioDuration = result.duration || 0;
+      detectedLanguage = result.language || "zh";
+    } else if (whisperModelSize === "funasr") {
+      // FunASR 自托管模式
+      try {
+        const funasrData = await postJson<any>(
+          `${funasrUrl}/recognition`,
+          { audio_url: accessibleUrl },
+          { timeoutMs: 120_000 }
+        );
+
+        // FunASR 返回格式: { text: "...", sentences: [{ start: 0, end: 5, text: "..." }] }
+        const sentences = funasrData.sentences || [];
+        transcriptionSegments = sentences.map((s: any) => ({
+          start: s.start || 0,
+          end: s.end || 0,
+          text: s.text || "",
+          speaker: s.speaker || "unknown",
+        }));
+        fullText = sentences.map((s: any) => s.text).join(" ");
+        audioDuration = sentences.length > 0 ? sentences[sentences.length - 1].end : 0;
+      } catch (funasrError: any) {
+        console.error("FunASR error:", funasrError.message);
+        throw new Error(`FunASR 调用失败: ${funasrError.message}`);
+      }
+    } else {
+      // AssemblyAI 模式
+      const client = getAssemblyClient();
+
+      const transcript = await client.transcripts.transcribe({
+        audio: accessibleUrl,
+        speaker_labels: true,
+        // @ts-ignore - API uses speech_models
+        speech_models: ["universal-2"] as any,
+      });
+
+      console.log("AssemblyAI transcription completed, status:", transcript.status);
+
+      if (transcript.status === "error") {
+        throw new Error(transcript.error || "Transcription failed");
+      }
+
+      // 等待转录完成（轮询）
+      let finalTranscript = transcript;
+      while (finalTranscript.status !== "completed" && finalTranscript.status !== "error") {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const statusResponse = await client.transcripts.get(finalTranscript.id);
+        finalTranscript = statusResponse;
+        console.log("Transcription status:", finalTranscript.status);
+      }
+
+      if (finalTranscript.status === "error") {
+        throw new Error(finalTranscript.error || "Transcription failed");
+      }
+
+      // 转换 AssemblyAI 结果为内部格式
+      transcriptionSegments = (finalTranscript.words || []).map((word: any) => ({
+        start: word.start / 1000, // 转换为秒
+        end: word.end / 1000,
+        text: word.text,
+        speaker: word.speaker || "unknown",
+      }));
+
+      // 合并文本用于 LLM 分析
+      fullText = (finalTranscript.words || [])
+        .map((word: any) => word.text)
+        .join(" ");
+
+      audioDuration = finalTranscript.audio_duration || 0;
+    }
+
+    console.log("Transcription text length:", fullText.length);
+
+    // 使用 LLM 进行智能分段
+    // 本地/外部 OpenAI 兼容服务：用网页设置里配置的 Key（本地服务留空即可）
+    const llmApiKey =
+      llmProvider === "local" ? readLocalAiConfig().apiKey || "local" : process.env.DEEPSEEK_API_KEY;
+    let llmSegments: any[] = [];
+
+    if (
+      llmApiKey &&
+      (llmProvider === "local" || llmProvider === "deepseek" || llmProvider === "openrouter")
+    ) {
+      try {
+        llmSegments = await segmentWithLLM(fullText, llmProvider, llmApiKey);
+      } catch (llmError) {
+        console.warn("LLM segmentation failed, using simple segmentation:", llmError);
+      }
+    }
+
+    // 如果 LLM 分段失败，使用简单的基于时间的分段
+    if (llmSegments.length === 0 && transcriptionSegments.length > 0) {
+      const duration = audioDuration || 0;
+      const segmentDuration = 30; // 每30秒一个片段
+      let currentStart = 0;
+
+      while (currentStart < duration) {
+        const currentEnd = Math.min(currentStart + segmentDuration, duration);
+        const segmentWords = transcriptionSegments.filter(
+          (w) => w.start >= currentStart && w.end <= currentEnd
+        );
+
+        if (segmentWords.length > 0) {
+          llmSegments.push({
+            start: currentStart,
+            end: currentEnd,
+            summary: segmentWords.map((w: any) => w.text).join(" ").substring(0, 100),
+            tags: ["auto", "segment"],
+          });
+        }
+
+        currentStart = currentEnd;
+      }
+    }
+
+    // 保存到数据库
+    const mediaName = mediaUrl.split("/").pop() || "unknown";
+    const audioAnalysisRecord = await db.insert(audioAnalysis).values({
+      userId: session.user.id,
+      mediaUrl,
+      mediaName,
+      language: detectedLanguage,
+      transcription: transcriptionSegments,
+      segments: llmSegments,
+      duration: Math.round(audioDuration || 0),
+      whisperModel: whisperModelSize || "assemblyai",
+      prompt: prompt || null,
+      status: "completed",
+    }).returning();
+
+    // 记录分析完成
+    await db.insert(operationLogs).values({
+      userId: session.user.id,
+      action: "analysis.complete",
+      resourceType: "audio",
+      resourceId: audioAnalysisRecord[0].id,
+      metadata: {
+        mediaUrl,
+        segmentCount: llmSegments.length,
+        language: detectedLanguage,
+        duration: Math.round(audioDuration || 0),
+      },
+    });
+
+    // 确保所有 segments 的 tags 都是数组
+    const safeSegments = llmSegments.map((seg: any) => ({
+      ...seg,
+      tags: Array.isArray(seg.tags) ? seg.tags : (typeof seg.tags === 'string' ? seg.tags.split(',').map((t: string) => t.trim()) : [])
+    }));
+
+    return NextResponse.json({
+      success: true,
+      id: audioAnalysisRecord[0].id,
+      language: detectedLanguage,
+      transcription: transcriptionSegments,
+      segments: safeSegments,
+      duration: Math.round(audioDuration || 0),
+    });
+  } catch (error: any) {
+    console.error("Audio analysis error:", error);
+
+    // 记录错误
+    try {
+      const session = await auth.api.getSession({ headers: request.headers });
+      if (session?.user) {
+        await db.insert(operationLogs).values({
+          userId: session.user.id,
+          action: "analysis.error",
+          resourceType: "audio",
+          metadata: { error: error.message },
+        });
+      }
+    } catch (logError) {
+      console.error("Failed to log error:", logError);
+    }
+
+    return NextResponse.json(
+      { error: error.message || "Audio analysis failed" },
+      { status: 500 }
+    );
+  }
+}
+
+/**
+ * 获取用户的音频分析历史
+ */
+export async function GET(request: NextRequest) {
+  try {
+    const session = await auth.api.getSession({ headers: request.headers });
+
+    if (!session?.user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const { searchParams } = new URL(request.url);
+    const limit = parseInt(searchParams.get("limit") || "20");
+    const offset = parseInt(searchParams.get("offset") || "0");
+
+    const records = await db.query.audioAnalysis.findMany({
+      where: (audioAnalysis, { eq }) => eq(audioAnalysis.userId, session.user.id),
+      orderBy: (audioAnalysis, { desc }) => [desc(audioAnalysis.createdAt)],
+      limit,
+      offset,
+    });
+
+    // 返回前按设置里的纠错规则修正台词（历史记录也会一起修正）
+    const rules = readLocalAiConfig().corrections;
+    const corrected = records.map((record) => ({
+      ...record,
+      transcription: Array.isArray(record.transcription)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        ? (record.transcription as any[]).map((seg) => ({
+            ...seg,
+            text: applyCorrections(seg?.text || "", rules),
+          }))
+        : record.transcription,
+    }));
+
+    return NextResponse.json({
+      success: true,
+      data: corrected,
+    });
+  } catch (error: any) {
+    console.error("Get audio analysis error:", error);
+    return NextResponse.json(
+      { error: error.message || "Failed to get records" },
+      { status: 500 }
+    );
+  }
+}
